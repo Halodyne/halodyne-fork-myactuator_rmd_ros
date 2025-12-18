@@ -101,8 +101,14 @@ namespace myactuator_rmd_hardware {
     }
     driver_ = std::make_unique<myactuator_rmd::CanDriver>(ifname_);
     actuator_interface_ = std::make_unique<myactuator_rmd::ActuatorInterface>(*driver_, actuator_id_);
+    motion_driver_ = std::make_unique<myactuator_rmd::motion_mode::CanDriver>(ifname_);
+    motion_actuator_interface_ = std::make_unique<myactuator_rmd::motion_mode::ActuatorInterface>(*motion_driver_, actuator_id_);
     if (!actuator_interface_) {
       RCLCPP_INFO(getLogger(), "Failed to create actuator interface!");
+      return CallbackReturn::ERROR;
+    }
+    if (!motion_actuator_interface_) {
+      RCLCPP_INFO(getLogger(), "Failed to create motion mode actuator interface!");
       return CallbackReturn::ERROR;
     }
     std::string const motor_model {actuator_interface_->getMotorModel()};
@@ -167,32 +173,34 @@ namespace myactuator_rmd_hardware {
     position_command_ = 0.0;
     velocity_command_ = 0.0;
     effort_command_ = 0.0;
+    motion_p_command_ = 0.0;
+    motion_v_command_ = 0.0;
+    motion_kp_command_ = 0.0;
+    motion_kd_command_ = 0.0;
+    motion_tff_command_ = 0.0;
 
     position_interface_running_.store(false);
     velocity_interface_running_.store(false);
     effort_interface_running_.store(false);
+    motion_interface_running_.store(false);
 
     if (info_.joints.size() != 1) {
       RCLCPP_FATAL(getLogger(), "Expected a single joint but got %zu joints.", info_.joints.size());
       return CallbackReturn::ERROR;
     }
     hardware_interface::ComponentInfo const& joint = info_.joints.at(0);
-
-    if (joint.command_interfaces.size() != 3) {
-      RCLCPP_FATAL(getLogger(), "Joint '%s' has %zu command interfaces found. 3 expected.",
-        joint.name.c_str(), joint.command_interfaces.size()
-      );
-      return CallbackReturn::ERROR;
+    // Accept at least the standard three command interfaces; allow extra motion_* ones
+    bool has_pos{false}, has_vel{false}, has_eff{false};
+    for (auto const &ci : joint.command_interfaces) {
+      if (ci.name == hardware_interface::HW_IF_POSITION) has_pos = true;
+      else if (ci.name == hardware_interface::HW_IF_VELOCITY) has_vel = true;
+      else if (ci.name == hardware_interface::HW_IF_EFFORT) has_eff = true;
+      // allow custom motion_* interfaces if present; no strict check here
     }
-    if (joint.command_interfaces[0].name != hardware_interface::HW_IF_POSITION &&
-        joint.command_interfaces[1].name != hardware_interface::HW_IF_VELOCITY &&
-        joint.command_interfaces[2].name != hardware_interface::HW_IF_EFFORT) {
+    if (!(has_pos && has_vel && has_eff)) {
       RCLCPP_FATAL(getLogger(),
-        "Joint '%s' has unexpected command interface '%s'. Expected '%s', '%s' and '%s' ",
-        joint.name.c_str(), joint.command_interfaces[0].name.c_str(),
-        hardware_interface::HW_IF_POSITION, hardware_interface::HW_IF_VELOCITY,
-        hardware_interface::HW_IF_EFFORT
-      );
+        "Joint '%s' must expose position, velocity, and effort command interfaces.",
+        joint.name.c_str());
       return CallbackReturn::ERROR;
     }
 
@@ -249,6 +257,22 @@ namespace myactuator_rmd_hardware {
     command_interfaces.emplace_back(hardware_interface::CommandInterface(
       info_.joints.at(0).name, hardware_interface::HW_IF_EFFORT, &effort_command_)
     );
+    // Optional motion mode command interfaces (position, velocity, kp, kd, torque_ff)
+    command_interfaces.emplace_back(hardware_interface::CommandInterface(
+      info_.joints.at(0).name, "motion_p", &motion_p_command_)
+    );
+    command_interfaces.emplace_back(hardware_interface::CommandInterface(
+      info_.joints.at(0).name, "motion_v", &motion_v_command_)
+    );
+    command_interfaces.emplace_back(hardware_interface::CommandInterface(
+      info_.joints.at(0).name, "motion_kp", &motion_kp_command_)
+    );
+    command_interfaces.emplace_back(hardware_interface::CommandInterface(
+      info_.joints.at(0).name, "motion_kd", &motion_kd_command_)
+    );
+    command_interfaces.emplace_back(hardware_interface::CommandInterface(
+      info_.joints.at(0).name, "motion_tff", &motion_tff_command_)
+    );
     return command_interfaces;
   }
 
@@ -257,6 +281,7 @@ namespace myactuator_rmd_hardware {
     bool position_interface_claimed {position_interface_running_.load()};
     bool velocity_interface_claimed {velocity_interface_running_.load()};
     bool effort_interface_claimed {effort_interface_running_.load()};
+    bool motion_interface_claimed {motion_interface_running_.load()};
 
     for (auto const& stop_interface: stop_interfaces) {
       if (stop_interface == info_.joints.at(0).name + "/" + hardware_interface::HW_IF_POSITION) {
@@ -265,6 +290,24 @@ namespace myactuator_rmd_hardware {
         velocity_interface_claimed = false;
       } else if (stop_interface == info_.joints.at(0).name + "/" + hardware_interface::HW_IF_EFFORT) {
         effort_interface_claimed = false;
+      } else if (stop_interface == info_.joints.at(0).name + "/motion_p" ||
+                 stop_interface == info_.joints.at(0).name + "/motion_v" ||
+                 stop_interface == info_.joints.at(0).name + "/motion_kp" ||
+                 stop_interface == info_.joints.at(0).name + "/motion_kd" ||
+                 stop_interface == info_.joints.at(0).name + "/motion_tff") {
+        motion_interface_claimed = false;
+      }
+    }
+
+    // Count motion_* interfaces that are requested to start
+    std::size_t motion_start_count {0};
+    for (auto const &start_interface : start_interfaces) {
+      if (start_interface == info_.joints.at(0).name + "/motion_p" ||
+          start_interface == info_.joints.at(0).name + "/motion_v" ||
+          start_interface == info_.joints.at(0).name + "/motion_kp" ||
+          start_interface == info_.joints.at(0).name + "/motion_kd" ||
+          start_interface == info_.joints.at(0).name + "/motion_tff") {
+        ++motion_start_count;
       }
     }
 
@@ -274,10 +317,18 @@ namespace myactuator_rmd_hardware {
           RCLCPP_ERROR(getLogger(), "Can't claim position interface: Conflicting interface!");
           return hardware_interface::return_type::ERROR;
         }
+        if (motion_interface_claimed || motion_start_count > 0) {
+          RCLCPP_ERROR(getLogger(), "Can't claim position interface: Conflicts with motion interfaces!");
+          return hardware_interface::return_type::ERROR;
+        }
         position_interface_claimed = true;
       } else if (start_interface == info_.joints.at(0).name + "/" + hardware_interface::HW_IF_VELOCITY) {
         if (position_interface_claimed || effort_interface_claimed) {
           RCLCPP_ERROR(getLogger(), "Can't claim velocity interface: Conflicting interface!");
+          return hardware_interface::return_type::ERROR;
+        }
+        if (motion_interface_claimed || motion_start_count > 0) {
+          RCLCPP_ERROR(getLogger(), "Can't claim velocity interface: Conflicts with motion interfaces!");
           return hardware_interface::return_type::ERROR;
         }
         velocity_interface_claimed = true;
@@ -289,8 +340,24 @@ namespace myactuator_rmd_hardware {
           RCLCPP_ERROR(getLogger(), "Can't claim effort interface: Conflicting interface!");
           return hardware_interface::return_type::ERROR;
         }
+        if (motion_interface_claimed || motion_start_count > 0) {
+          RCLCPP_ERROR(getLogger(), "Can't claim effort interface: Conflicts with motion interfaces!");
+          return hardware_interface::return_type::ERROR;
+        }
         effort_interface_claimed = true;
       }
+    }
+
+    if (motion_start_count > 0) {
+      if (motion_start_count != 5) {
+        RCLCPP_ERROR(getLogger(), "Must claim all 5 motion_* interfaces together (p, v, kp, kd, tff)!");
+        return hardware_interface::return_type::ERROR;
+      }
+      if (position_interface_claimed || velocity_interface_claimed || effort_interface_claimed) {
+        RCLCPP_ERROR(getLogger(), "Can't claim motion interfaces: Conflicting standard interface claimed!");
+        return hardware_interface::return_type::ERROR;
+      }
+      motion_interface_claimed = true;
     }
 
     return hardware_interface::return_type::OK;
@@ -308,6 +375,24 @@ namespace myactuator_rmd_hardware {
       } else if (stop_interface == info_.joints.at(0).name + "/" + hardware_interface::HW_IF_EFFORT) {
         effort_interface_running_.store(false);
         RCLCPP_INFO(getLogger(), "Stopping effort interface...");
+      } else if (stop_interface == info_.joints.at(0).name + "/motion_p" ||
+                 stop_interface == info_.joints.at(0).name + "/motion_v" ||
+                 stop_interface == info_.joints.at(0).name + "/motion_kp" ||
+                 stop_interface == info_.joints.at(0).name + "/motion_kd" ||
+                 stop_interface == info_.joints.at(0).name + "/motion_tff") {
+        motion_interface_running_.store(false);
+        RCLCPP_INFO(getLogger(), "Stopping motion interfaces...");
+      }
+    }
+
+    std::size_t motion_start_count {0};
+    for (auto const &start_interface : start_interfaces) {
+      if (start_interface == info_.joints.at(0).name + "/motion_p" ||
+          start_interface == info_.joints.at(0).name + "/motion_v" ||
+          start_interface == info_.joints.at(0).name + "/motion_kp" ||
+          start_interface == info_.joints.at(0).name + "/motion_kd" ||
+          start_interface == info_.joints.at(0).name + "/motion_tff") {
+        ++motion_start_count;
       }
     }
 
@@ -322,6 +407,11 @@ namespace myactuator_rmd_hardware {
         effort_interface_running_.store(true);
         RCLCPP_INFO(getLogger(), "Starting effort interface...");
       }
+    }
+
+    if (motion_start_count == 5) {
+      motion_interface_running_.store(true);
+      RCLCPP_INFO(getLogger(), "Starting motion interfaces...");
     }
 
     return hardware_interface::return_type::OK;
@@ -344,6 +434,12 @@ namespace myactuator_rmd_hardware {
       async_velocity_command_.store(velocity_command_);
     } else if (effort_interface_running_) {
       async_effort_command_.store(effort_command_);
+    } else if (motion_interface_running_) {
+      async_motion_p_command_.store(motion_p_command_);
+      async_motion_v_command_.store(motion_v_command_);
+      async_motion_kp_command_.store(motion_kp_command_);
+      async_motion_kd_command_.store(motion_kd_command_);
+      async_motion_tff_command_.store(motion_tff_command_);
     }
     return hardware_interface::return_type::OK;
   }
@@ -363,6 +459,22 @@ namespace myactuator_rmd_hardware {
         feedback_ = actuator_interface_->sendVelocitySetpoint(radToDeg(async_velocity_command_.load()));
       } else if (effort_interface_running_) {
         feedback_ = actuator_interface_->sendTorqueSetpoint(async_effort_command_.load(), torque_constant_);
+      } else if (motion_interface_running_) {
+        // Clamp kp/kd to [0, 4095] and cast to uint16_t
+        auto clamp12 = [](double x) -> std::uint16_t {
+          if (x < 0.0) return static_cast<std::uint16_t>(0);
+          if (x > 4095.0) return static_cast<std::uint16_t>(4095);
+          return static_cast<std::uint16_t>(x);
+        };
+        auto const p = async_motion_p_command_.load();
+        auto const v = async_motion_v_command_.load();
+        auto const kp = clamp12(async_motion_kp_command_.load());
+        auto const kd = clamp12(async_motion_kd_command_.load());
+        auto const tff = async_motion_tff_command_.load();
+        // TODO: Consider map response from Motion mode control to feedback instead of asking.
+        (void) motion_actuator_interface_->motionModeControl(static_cast<float>(p), static_cast<float>(v), kp, kd, static_cast<float>(tff));
+        // Read status to keep states refreshed
+        feedback_ = actuator_interface_->getMotorStatus2();
       } else {
         feedback_ = actuator_interface_->getMotorStatus2();
       }

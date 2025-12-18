@@ -278,6 +278,12 @@ namespace myactuator_rmd_hardware {
       double position_command_;
       double velocity_command_;
       double effort_command_;
+      // Motion mode commands (position [rad], velocity [rad/s], kp [raw 0..4095], kd [raw 0..4095], torque_ff [Nm])
+      double motion_p_command_;
+      double motion_v_command_;
+      double motion_kp_command_;
+      double motion_kd_command_;
+      double motion_tff_command_;
       std::unique_ptr<LowPassFilter> velocity_low_pass_filter_;
       std::unique_ptr<LowPassFilter> effort_low_pass_filter_;
 
@@ -287,6 +293,9 @@ namespace myactuator_rmd_hardware {
       // Never accessed by both threads at the same time
       std::unique_ptr<myactuator_rmd::CanDriver> driver_;
       std::unique_ptr<myactuator_rmd::ActuatorInterface> actuator_interface_;
+      // Motion mode actuator interface
+      std::unique_ptr<myactuator_rmd::motion_mode::CanDriver> motion_driver_;
+      std::unique_ptr<myactuator_rmd::motion_mode::ActuatorInterface> motion_actuator_interface_;
       myactuator_rmd::Feedback feedback_;
       // Shared between the two threads
       std::atomic<bool> stop_async_thread_;
@@ -297,9 +306,16 @@ namespace myactuator_rmd_hardware {
       std::atomic<double> async_position_command_;
       std::atomic<double> async_velocity_command_;
       std::atomic<double> async_effort_command_;
+        std::atomic<double> async_motion_p_command_;
+        std::atomic<double> async_motion_v_command_;
+        std::atomic<double> async_motion_kp_command_;
+        std::atomic<double> async_motion_kd_command_;
+        std::atomic<double> async_motion_tff_command_;
       std::atomic<bool> position_interface_running_;
       std::atomic<bool> velocity_interface_running_;
       std::atomic<bool> effort_interface_running_;
+        std::atomic<bool> motion_interface_running_;
+
   };
 
 }  // namespace myactuator_rmd_hardware
