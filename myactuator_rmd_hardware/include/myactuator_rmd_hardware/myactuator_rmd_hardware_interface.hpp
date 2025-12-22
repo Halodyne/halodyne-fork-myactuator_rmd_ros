@@ -306,15 +306,15 @@ namespace myactuator_rmd_hardware {
       std::atomic<double> async_position_command_;
       std::atomic<double> async_velocity_command_;
       std::atomic<double> async_effort_command_;
-        std::atomic<double> async_motion_p_command_;
-        std::atomic<double> async_motion_v_command_;
-        std::atomic<double> async_motion_kp_command_;
-        std::atomic<double> async_motion_kd_command_;
-        std::atomic<double> async_motion_tff_command_;
+      std::atomic<double> async_motion_p_command_;
+      std::atomic<double> async_motion_v_command_;
+      std::atomic<double> async_motion_kp_command_;
+      std::atomic<double> async_motion_kd_command_;
+      std::atomic<double> async_motion_tff_command_;
       std::atomic<bool> position_interface_running_;
       std::atomic<bool> velocity_interface_running_;
       std::atomic<bool> effort_interface_running_;
-        std::atomic<bool> motion_interface_running_;
+      std::atomic<bool> motion_interface_running_;
 
   };
 

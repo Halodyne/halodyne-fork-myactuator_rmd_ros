@@ -472,9 +472,21 @@ namespace myactuator_rmd_hardware {
         auto const kd = clamp12(async_motion_kd_command_.load());
         auto const tff = async_motion_tff_command_.load();
         // TODO: Consider map response from Motion mode control to feedback instead of asking.
-        (void) motion_actuator_interface_->motionModeControl(static_cast<float>(p), static_cast<float>(v), kp, kd, static_cast<float>(tff));
+        auto response = motion_actuator_interface_->motionModeControl(static_cast<float>(p), static_cast<float>(v), kp, kd, static_cast<float>(tff));
         // Read status to keep states refreshed
-        feedback_ = actuator_interface_->getMotorStatus2();
+        auto const position = actuator_interface_->getMultiTurnAngle();
+        async_position_state_.store(degToRad(position));
+        async_effort_state_.store(response.getTorque());
+        auto velocity = (position - feedback_.shaft_angle) / (static_cast<double>(cycle_time.count()) / 1000.0);
+        if (velocity_low_pass_filter_) {
+          velocity = velocity_low_pass_filter_->apply(velocity);
+        }
+        async_velocity_state_.store(degToRad(velocity));
+        feedback_.shaft_angle = position;
+        feedback_.shaft_speed = velocity;
+        feedback_.current = torqueToCurrent(response.getTorque(), torque_constant_);
+        std::this_thread::sleep_until(wakeup_time);
+        continue;        
       } else {
         feedback_ = actuator_interface_->getMotorStatus2();
       }
