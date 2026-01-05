@@ -56,7 +56,7 @@ def generate_launch_description():
     )
     controller_cmd = DeclareLaunchArgument(
         controller_parameter_name,
-        choices=['forward_position_controller', 'joint_trajectory_controller'],
+        choices=['forward_position_controller', 'joint_trajectory_controller', 'motion_controller'],
         default_value='joint_trajectory_controller',
         description='Controller to be spawned'
     )

@@ -1,6 +1,6 @@
 controller_manager:
   ros__parameters:
-    update_rate: 100 # Hz
+    update_rate: 500 # Hz
 
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
@@ -16,6 +16,9 @@ controller_manager:
 
     joint_trajectory_controller:
       type: joint_trajectory_controller/JointTrajectoryController
+
+    motion_controller:
+      type: motion_command_controller/MotionCommandController
 
 
 effort_controller:
@@ -51,3 +54,8 @@ joint_trajectory_controller:
     constraints:
       stopped_velocity_tolerance: 0.01
       goal_time: 0.1
+
+motion_controller:
+  ros__parameters:
+    joints:
+      - joint

@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>motion_command_controller</name>
+  <version>0.1.0</version>
+  <description>Single-topic controller for MyActuator motion-mode (p, v, kp, kd, tff).</description>
+  <maintainer email="dev@halodyne.ai">Halodyne</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>controller_interface</depend>
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+    <controller_interface plugin="share/motion_command_controller/motion_command_controller.xml"/>
+  </export>
+</package>
