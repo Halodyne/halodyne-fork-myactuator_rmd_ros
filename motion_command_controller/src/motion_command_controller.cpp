@@ -38,23 +38,16 @@ controller_interface::CallbackReturn MotionCommandController::on_configure(const
 controller_interface::InterfaceConfiguration MotionCommandController::command_interface_configuration() const {
   controller_interface::InterfaceConfiguration conf;
   conf.type = controller_interface::interface_configuration_type::INDIVIDUAL;
-  std::string name = joint_name_;
-  // In case joint_name_ not yet set, try to read directly from parameter
-  if (name.empty()) {
-    auto node = get_node();
-    if (node) {
-      auto joints = node->get_parameter("joints").as_string_array();
-      if (!joints.empty()) {
-        name = joints.front();
-      }
-    }
+  // Check that joint_name_ is set
+  if (joint_name_.empty()) {
+    throw std::runtime_error("No joint name set. Check if on_configure() was called or if the 'joints' parameter is set.");
   }
   conf.names.reserve(5);
-  conf.names.emplace_back(name + "/motion_p");
-  conf.names.emplace_back(name + "/motion_v");
-  conf.names.emplace_back(name + "/motion_kp");
-  conf.names.emplace_back(name + "/motion_kd");
-  conf.names.emplace_back(name + "/motion_tff");
+  conf.names.emplace_back(joint_name_ + "/motion_p");
+  conf.names.emplace_back(joint_name_ + "/motion_v");
+  conf.names.emplace_back(joint_name_ + "/motion_kp");
+  conf.names.emplace_back(joint_name_ + "/motion_kd");
+  conf.names.emplace_back(joint_name_ + "/motion_tff");
   return conf;
 }
 
