@@ -477,7 +477,7 @@ namespace myactuator_rmd_hardware {
         auto const position = actuator_interface_->getMultiTurnAngle();
         async_position_state_.store(degToRad(position));
         async_effort_state_.store(response.getTorque());
-        auto velocity = (position - feedback_.shaft_angle) / (static_cast<double>(cycle_time.count()) / 1000.0);
+        auto velocity = radToDeg(static_cast<double>(response.getVelocity()));
         if (velocity_low_pass_filter_) {
           velocity = velocity_low_pass_filter_->apply(velocity);
         }
