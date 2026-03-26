@@ -22,9 +22,16 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
+option(ASYNC_LOOP_STATS "Enable async loop timing instrumentation" OFF)
+
 target_compile_definitions(${PROJECT_NAME} PRIVATE
   MYACTUATOR_RMD_HARDWARE_BUILDING_LIBRARY
 )
+if(ASYNC_LOOP_STATS)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE
+    MYACTUATOR_RMD_HARDWARE__ASYNC_LOOP_STATS
+  )
+endif()
 # Required for std::atomic
 target_link_libraries(${PROJECT_NAME}
   atomic

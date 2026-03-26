@@ -501,6 +501,15 @@ namespace myactuator_rmd_hardware {
       }
     };
 
+#ifdef MYACTUATOR_RMD_HARDWARE__ASYNC_LOOP_STATS
+    std::uint64_t loop_count {0};
+    std::uint64_t overrun_count {0};
+    double total_io_us {0.0};
+    double max_io_us {0.0};
+    auto stats_start = std::chrono::steady_clock::now();
+    const auto stats_interval = std::chrono::seconds(5);
+#endif
+
     while (!stop_async_thread_) {
       auto const now {std::chrono::steady_clock::now()};
       auto const wakeup_time {now + cycle_time};
@@ -572,10 +581,38 @@ namespace myactuator_rmd_hardware {
           auto const kp = clamp12(async_motion_kp_command_.load());
           auto const kd = clamp12(async_motion_kd_command_.load());
           auto const tff = async_motion_tff_command_.load();
-          // TODO: Consider map response from Motion mode control to feedback instead of asking.
-          auto response = motion_actuator_interface_->motionModeControl(static_cast<float>(p), static_cast<float>(v), kp, kd, static_cast<float>(tff));
-          // Read status to keep states refreshed
-          auto const position = actuator_interface_->getMultiTurnAngle();
+          // Interleaved send/recv: send both commands first, then receive both
+          // responses. This overlaps the motor processing time for the angle
+          // request with the wait for the motion mode response, saving ~0.75ms
+          // per cycle and enabling 500Hz operation.
+          motion_actuator_interface_->sendMotionModeControl(static_cast<float>(p), static_cast<float>(v), kp, kd, static_cast<float>(tff));
+          actuator_interface_->sendGetMultiTurnAngle();
+          auto response = motion_actuator_interface_->recvMotionModeControl();
+          auto const position = actuator_interface_->recvGetMultiTurnAngle();
+#ifdef MYACTUATOR_RMD_HARDWARE__ASYNC_LOOP_STATS
+          {
+            auto const io_end {std::chrono::steady_clock::now()};
+            double const io_us {std::chrono::duration<double, std::micro>(io_end - now).count()};
+            total_io_us += io_us;
+            if (io_us > max_io_us) max_io_us = io_us;
+            ++loop_count;
+            if (io_end > wakeup_time) ++overrun_count;
+            if (io_end - stats_start >= stats_interval) {
+              double const actual_rate = static_cast<double>(loop_count) /
+                std::chrono::duration<double>(io_end - stats_start).count();
+              RCLCPP_INFO(getLogger(),
+                "Async loop [id=%u]: rate=%.1f Hz, io_mean=%.0f us, io_max=%.0f us, overruns=%lu/%lu (%.1f%%)",
+                actuator_id_, actual_rate, total_io_us / loop_count, max_io_us,
+                overrun_count, loop_count,
+                100.0 * static_cast<double>(overrun_count) / loop_count);
+              loop_count = 0;
+              overrun_count = 0;
+              total_io_us = 0.0;
+              max_io_us = 0.0;
+              stats_start = io_end;
+            }
+          }
+#endif
           async_position_state_.store(degToRad(position));
           async_effort_state_.store(response.getTorque());
           auto velocity = radToDeg(static_cast<double>(response.getVelocity()));
