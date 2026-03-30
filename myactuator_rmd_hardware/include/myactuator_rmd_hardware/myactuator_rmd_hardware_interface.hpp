@@ -316,6 +316,9 @@ namespace myactuator_rmd_hardware {
       std::atomic<bool> effort_interface_running_;
       std::atomic<bool> motion_interface_running_;
 
+      std::atomic<bool> motor_online_{false};
+      std::atomic<bool> motor_first_reading_valid_{false};
+
   };
 
 }  // namespace myactuator_rmd_hardware
