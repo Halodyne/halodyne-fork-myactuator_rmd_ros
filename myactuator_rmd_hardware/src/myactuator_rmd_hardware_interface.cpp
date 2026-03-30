@@ -15,6 +15,9 @@
   #define MYACTUATOR_RMD_HARDWARE__THREAD_PRIORITY
 #endif
 
+#include <myactuator_rmd/can/exceptions.hpp>
+#include <myactuator_rmd/exceptions.hpp>
+
 #include <hardware_interface/actuator_interface.hpp>
 #include <hardware_interface/handle.hpp>
 #include <hardware_interface/hardware_info.hpp>
@@ -111,8 +114,19 @@ namespace myactuator_rmd_hardware {
       RCLCPP_INFO(getLogger(), "Failed to create motion mode actuator interface!");
       return CallbackReturn::ERROR;
     }
-    std::string const motor_model {actuator_interface_->getMotorModel()};
-    RCLCPP_INFO(getLogger(), "Started actuator interface for actuator model '%s'!", motor_model.c_str());
+    try {
+      std::string const motor_model {actuator_interface_->getMotorModel()};
+      RCLCPP_INFO(getLogger(), "Started actuator interface for actuator model '%s'!", motor_model.c_str());
+      motor_online_.store(true);
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(getLogger(), "Motor %u not responding at startup (%s), will probe in background",
+        actuator_id_, e.what());
+      motor_online_.store(false);
+      motor_first_reading_valid_.store(false);
+      async_position_state_.store(std::numeric_limits<double>::quiet_NaN());
+      async_velocity_state_.store(std::numeric_limits<double>::quiet_NaN());
+      async_effort_state_.store(std::numeric_limits<double>::quiet_NaN());
+    }
     stop_async_thread_.store(false);
     if (!startAsyncThread(cycle_time_)) {
       RCLCPP_FATAL(getLogger(), "Failed to start async thread!");
@@ -449,60 +463,159 @@ namespace myactuator_rmd_hardware {
   }
 
   void MyActuatorRmdHardwareInterface::asyncThread(std::chrono::milliseconds const& cycle_time) {
-    actuator_interface_->setTimeout(timeout_);
+    if (motor_online_.load()) {
+      try {
+        actuator_interface_->setTimeout(timeout_);
+      } catch (const std::exception& e) {
+        RCLCPP_WARN(getLogger(), "Motor %u failed to set timeout: %s", actuator_id_, e.what());
+        motor_online_.store(false);
+        motor_first_reading_valid_.store(false);
+      }
+    }
+
+    constexpr int MAX_CONSECUTIVE_ERRORS = 5;
+    int consecutive_errors = 0;
+    bool first_error_logged = false;
+    int offline_tick_counter = 0;
+    int const probe_interval_ticks = std::max(1, static_cast<int>(500 / cycle_time.count()));
+
+    auto go_offline = [this, &offline_tick_counter]() {
+      motor_online_.store(false);
+      motor_first_reading_valid_.store(false);
+      async_position_state_.store(std::numeric_limits<double>::quiet_NaN());
+      async_velocity_state_.store(std::numeric_limits<double>::quiet_NaN());
+      async_effort_state_.store(std::numeric_limits<double>::quiet_NaN());
+      offline_tick_counter = 0;
+    };
+
+    auto handle_error = [this, &consecutive_errors, &first_error_logged, &go_offline](const std::exception& e) {
+      consecutive_errors++;
+      if (!first_error_logged) {
+        RCLCPP_WARN(getLogger(), "Motor %u CAN error: %s", actuator_id_, e.what());
+        first_error_logged = true;
+      }
+      if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+        RCLCPP_ERROR(getLogger(), "Motor %u went offline after %d consecutive errors",
+          actuator_id_, MAX_CONSECUTIVE_ERRORS);
+        go_offline();
+      }
+    };
+
     while (!stop_async_thread_) {
       auto const now {std::chrono::steady_clock::now()};
       auto const wakeup_time {now + cycle_time};
-      if (position_interface_running_) {
-        feedback_ = actuator_interface_->sendPositionAbsoluteSetpoint(radToDeg(async_position_command_.load()), max_velocity_);
-      } else if (velocity_interface_running_) {
-        feedback_ = actuator_interface_->sendVelocitySetpoint(radToDeg(async_velocity_command_.load()));
-      } else if (effort_interface_running_) {
-        feedback_ = actuator_interface_->sendTorqueSetpoint(async_effort_command_.load(), torque_constant_);
-      } else if (motion_interface_running_) {
-        // Clamp kp/kd to [0, 4095] and cast to uint16_t
-        auto clamp12 = [](double x) -> std::uint16_t {
-          if (x < 0.0) return static_cast<std::uint16_t>(0);
-          if (x > 4095.0) return static_cast<std::uint16_t>(4095);
-          return static_cast<std::uint16_t>(x);
-        };
-        auto const p = async_motion_p_command_.load();
-        auto const v = async_motion_v_command_.load();
-        auto const kp = clamp12(async_motion_kp_command_.load());
-        auto const kd = clamp12(async_motion_kd_command_.load());
-        auto const tff = async_motion_tff_command_.load();
-        // TODO: Consider map response from Motion mode control to feedback instead of asking.
-        auto response = motion_actuator_interface_->motionModeControl(static_cast<float>(p), static_cast<float>(v), kp, kd, static_cast<float>(tff));
-        // Read status to keep states refreshed
-        auto const position = actuator_interface_->getMultiTurnAngle();
-        async_position_state_.store(degToRad(position));
-        async_effort_state_.store(response.getTorque());
-        auto velocity = radToDeg(static_cast<double>(response.getVelocity()));
-        if (velocity_low_pass_filter_) {
-          velocity = velocity_low_pass_filter_->apply(velocity);
+
+      // --- OFFLINE: probe periodically ---
+      if (!motor_online_.load()) {
+        offline_tick_counter++;
+        if (offline_tick_counter >= probe_interval_ticks) {
+          offline_tick_counter = 0;
+          try {
+            (void)actuator_interface_->getMotorModel();
+            actuator_interface_->setTimeout(timeout_);
+            motor_online_.store(true);
+            motor_first_reading_valid_.store(false);
+            consecutive_errors = 0;
+            first_error_logged = false;
+            RCLCPP_INFO(getLogger(), "Motor %u came online", actuator_id_);
+          } catch (...) {
+            // Still offline
+          }
         }
-        async_velocity_state_.store(degToRad(velocity));
-        feedback_.shaft_angle = position;
-        feedback_.shaft_speed = velocity;
-        feedback_.current = torqueToCurrent(response.getTorque(), torque_constant_);
         std::this_thread::sleep_until(wakeup_time);
-        continue;        
-      } else {
-        feedback_ = actuator_interface_->getMotorStatus2();
+        continue;
       }
 
-      double const position_state {feedback_.shaft_angle};
-      double velocity_state {feedback_.shaft_speed};
-      if (velocity_low_pass_filter_) {
-        velocity_state = velocity_low_pass_filter_->apply(velocity_state);
+      // --- FIRST READING: read position only, no command ---
+      if (!motor_first_reading_valid_.load()) {
+        try {
+          feedback_ = actuator_interface_->getMotorStatus2();
+          double const position_state {feedback_.shaft_angle};
+          double velocity_state {feedback_.shaft_speed};
+          if (velocity_low_pass_filter_) {
+            velocity_state = velocity_low_pass_filter_->apply(velocity_state);
+          }
+          double current_state {feedback_.current};
+          if (effort_low_pass_filter_) {
+            current_state = effort_low_pass_filter_->apply(current_state);
+          }
+          async_position_state_.store(degToRad(position_state));
+          async_velocity_state_.store(degToRad(velocity_state));
+          async_effort_state_.store(currentToTorque(current_state, torque_constant_));
+          motor_first_reading_valid_.store(true);
+          RCLCPP_INFO(getLogger(), "Motor %u first reading valid (pos=%.1f deg)", actuator_id_, position_state);
+        } catch (const std::exception& e) {
+          RCLCPP_WARN(getLogger(), "Motor %u first reading failed: %s", actuator_id_, e.what());
+          go_offline();
+        }
+        std::this_thread::sleep_until(wakeup_time);
+        continue;
       }
-      double current_state {feedback_.current};
-      if (effort_low_pass_filter_) {
-        current_state = effort_low_pass_filter_->apply(current_state);
+
+      // --- NORMAL OPERATION ---
+      try {
+        if (position_interface_running_) {
+          feedback_ = actuator_interface_->sendPositionAbsoluteSetpoint(radToDeg(async_position_command_.load()), max_velocity_);
+        } else if (velocity_interface_running_) {
+          feedback_ = actuator_interface_->sendVelocitySetpoint(radToDeg(async_velocity_command_.load()));
+        } else if (effort_interface_running_) {
+          feedback_ = actuator_interface_->sendTorqueSetpoint(async_effort_command_.load(), torque_constant_);
+        } else if (motion_interface_running_) {
+          // Clamp kp/kd to [0, 4095] and cast to uint16_t
+          auto clamp12 = [](double x) -> std::uint16_t {
+            if (x < 0.0) return static_cast<std::uint16_t>(0);
+            if (x > 4095.0) return static_cast<std::uint16_t>(4095);
+            return static_cast<std::uint16_t>(x);
+          };
+          auto const p = async_motion_p_command_.load();
+          auto const v = async_motion_v_command_.load();
+          auto const kp = clamp12(async_motion_kp_command_.load());
+          auto const kd = clamp12(async_motion_kd_command_.load());
+          auto const tff = async_motion_tff_command_.load();
+          // TODO: Consider map response from Motion mode control to feedback instead of asking.
+          auto response = motion_actuator_interface_->motionModeControl(static_cast<float>(p), static_cast<float>(v), kp, kd, static_cast<float>(tff));
+          // Read status to keep states refreshed
+          auto const position = actuator_interface_->getMultiTurnAngle();
+          async_position_state_.store(degToRad(position));
+          async_effort_state_.store(response.getTorque());
+          auto velocity = radToDeg(static_cast<double>(response.getVelocity()));
+          if (velocity_low_pass_filter_) {
+            velocity = velocity_low_pass_filter_->apply(velocity);
+          }
+          async_velocity_state_.store(degToRad(velocity));
+          feedback_.shaft_angle = position;
+          feedback_.shaft_speed = velocity;
+          feedback_.current = torqueToCurrent(response.getTorque(), torque_constant_);
+          consecutive_errors = 0;
+          first_error_logged = false;
+          std::this_thread::sleep_until(wakeup_time);
+          continue;
+        } else {
+          feedback_ = actuator_interface_->getMotorStatus2();
+        }
+
+        double const position_state {feedback_.shaft_angle};
+        double velocity_state {feedback_.shaft_speed};
+        if (velocity_low_pass_filter_) {
+          velocity_state = velocity_low_pass_filter_->apply(velocity_state);
+        }
+        double current_state {feedback_.current};
+        if (effort_low_pass_filter_) {
+          current_state = effort_low_pass_filter_->apply(current_state);
+        }
+        async_position_state_.store(degToRad(position_state));
+        async_velocity_state_.store(degToRad(velocity_state));
+        async_effort_state_.store(currentToTorque(current_state, torque_constant_));
+
+        consecutive_errors = 0;
+        first_error_logged = false;
+      } catch (const myactuator_rmd::can::Exception& e) {
+        handle_error(e);
+      } catch (const myactuator_rmd::Exception& e) {
+        handle_error(e);
+      } catch (const std::exception& e) {
+        handle_error(e);
       }
-      async_position_state_.store(degToRad(position_state));
-      async_velocity_state_.store(degToRad(velocity_state));
-      async_effort_state_.store(currentToTorque(current_state, torque_constant_));
 
       std::this_thread::sleep_until(wakeup_time);
     }
