@@ -510,9 +510,10 @@ namespace myactuator_rmd_hardware {
     const auto stats_interval = std::chrono::seconds(5);
 #endif
 
+    auto wakeup_time {std::chrono::steady_clock::now()};
     while (!stop_async_thread_) {
       auto const now {std::chrono::steady_clock::now()};
-      auto const wakeup_time {now + cycle_time};
+      wakeup_time += cycle_time;
 
       // --- OFFLINE: probe periodically ---
       if (!motor_online_.load()) {
