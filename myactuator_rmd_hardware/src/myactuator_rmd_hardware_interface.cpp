@@ -24,15 +24,19 @@
 #include <hardware_interface/types/hardware_interface_return_values.hpp>
 #include <hardware_interface/types/hardware_interface_type_values.hpp>
 #include <myactuator_rmd/actuator_interface.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <rclcpp/duration.hpp>
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
+#include <rclcpp/node.hpp>
 #include <rclcpp/time.hpp>
 #include <rclcpp_lifecycle/state.hpp>
 
 
 #include "myactuator_rmd_hardware/conversions.hpp"
 #include "myactuator_rmd_hardware/low_pass_filter.hpp"
+#include "myactuator_rmd_hardware/velocity_estimators.hpp"
 
 
 namespace myactuator_rmd_hardware {
@@ -127,6 +131,60 @@ namespace myactuator_rmd_hardware {
       async_velocity_state_.store(std::numeric_limits<double>::quiet_NaN());
       async_effort_state_.store(std::numeric_limits<double>::quiet_NaN());
     }
+    // Parse 1-Euro filter parameters from URDF hardware parameters
+    double oe_min_cutoff = 1.0;
+    double oe_beta = 5.0;
+    double oe_d_cutoff = 1.0;
+    if (info_.hardware_parameters.find("velocity_min_cutoff") != info_.hardware_parameters.end()) {
+      oe_min_cutoff = std::stod(info_.hardware_parameters["velocity_min_cutoff"]);
+    }
+    if (info_.hardware_parameters.find("velocity_beta") != info_.hardware_parameters.end()) {
+      oe_beta = std::stod(info_.hardware_parameters["velocity_beta"]);
+    }
+    if (info_.hardware_parameters.find("velocity_d_cutoff") != info_.hardware_parameters.end()) {
+      oe_d_cutoff = std::stod(info_.hardware_parameters["velocity_d_cutoff"]);
+    }
+    RCLCPP_INFO(getLogger(), "1-Euro velocity filter: min_cutoff=%.2f Hz, beta=%.2f, d_cutoff=%.2f Hz",
+      oe_min_cutoff, oe_beta, oe_d_cutoff);
+
+    // Create 1-Euro velocity estimator
+    double const dt_s = cycle_time_.count() / 1000.0;
+    velocity_estimator_ = std::make_unique<OneEuroEstimator>(dt_s, oe_min_cutoff, oe_beta, oe_d_cutoff);
+
+    // Create parameter node for runtime tuning
+    auto const id_str = std::to_string(actuator_id_);
+    param_node_ = rclcpp::Node::make_shared("motor_" + id_str + "_params");
+    motion_debug_pub_ = param_node_->create_publisher<std_msgs::msg::Float64MultiArray>(
+      "motor_" + id_str + "_motion_raw", 10);
+    param_node_->declare_parameter("velocity_min_cutoff", oe_min_cutoff);
+    param_node_->declare_parameter("velocity_beta", oe_beta);
+    param_node_->declare_parameter("velocity_d_cutoff", oe_d_cutoff);
+    param_callback_handle_ = param_node_->add_on_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter>& params) {
+        for (auto const& p : params) {
+          if (p.get_name() == "velocity_min_cutoff") {
+            velocity_estimator_->setMinCutoff(p.as_double());
+            RCLCPP_INFO(getLogger(), "Motor %u velocity_min_cutoff set to %.2f", actuator_id_, p.as_double());
+          } else if (p.get_name() == "velocity_beta") {
+            velocity_estimator_->setBeta(p.as_double());
+            RCLCPP_INFO(getLogger(), "Motor %u velocity_beta set to %.2f", actuator_id_, p.as_double());
+          } else if (p.get_name() == "velocity_d_cutoff") {
+            velocity_estimator_->setDCutoff(p.as_double());
+            RCLCPP_INFO(getLogger(), "Motor %u velocity_d_cutoff set to %.2f", actuator_id_, p.as_double());
+          }
+        }
+        rcl_interfaces::msg::SetParametersResult result;
+        result.successful = true;
+        return result;
+      });
+
+    // Spin param node in background thread for runtime parameter updates
+    param_executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+    param_executor_->add_node(param_node_);
+    param_spin_thread_ = std::thread([this]() {
+      param_executor_->spin();
+    });
+
     stop_async_thread_.store(false);
     if (!startAsyncThread(cycle_time_)) {
       RCLCPP_FATAL(getLogger(), "Failed to start async thread!");
@@ -135,17 +193,29 @@ namespace myactuator_rmd_hardware {
 
     return CallbackReturn::SUCCESS;
   }
-      
+
   CallbackReturn MyActuatorRmdHardwareInterface::on_cleanup(rclcpp_lifecycle::State const& /*previous_state*/) {
     stopAsyncThread();
+    if (param_executor_) {
+      param_executor_->cancel();
+    }
+    if (param_spin_thread_.joinable()) {
+      param_spin_thread_.join();
+    }
     if (actuator_interface_) {
       actuator_interface_->shutdownMotor();
     }
     return CallbackReturn::SUCCESS;
   }
-  
+
   CallbackReturn MyActuatorRmdHardwareInterface::on_shutdown(rclcpp_lifecycle::State const& /*previous_state*/) {
     stopAsyncThread();
+    if (param_executor_) {
+      param_executor_->cancel();
+    }
+    if (param_spin_thread_.joinable()) {
+      param_spin_thread_.join();
+    }
     if (actuator_interface_) {
       actuator_interface_->shutdownMotor();
     }
@@ -614,15 +684,20 @@ namespace myactuator_rmd_hardware {
             }
           }
 #endif
-          async_position_state_.store(degToRad(position));
+          auto const position_rad = degToRad(position);
+          async_position_state_.store(position_rad);
           async_effort_state_.store(response.getTorque());
-          auto velocity = radToDeg(static_cast<double>(response.getVelocity()));
-          if (velocity_low_pass_filter_) {
-            velocity = velocity_low_pass_filter_->apply(velocity);
+          auto const velocity_rad = velocity_estimator_->update(position_rad);
+          async_velocity_state_.store(velocity_rad);
+          // Publish raw motion debug data: [cmd_pos, cmd_vel, raw_pos, raw_vel, torque]
+          {
+            std_msgs::msg::Float64MultiArray msg;
+            msg.data = {p, v, position_rad, static_cast<double>(response.getVelocity()),
+                        static_cast<double>(response.getTorque())};
+            motion_debug_pub_->publish(msg);
           }
-          async_velocity_state_.store(degToRad(velocity));
           feedback_.shaft_angle = position;
-          feedback_.shaft_speed = velocity;
+          feedback_.shaft_speed = radToDeg(velocity_rad);
           feedback_.current = torqueToCurrent(response.getTorque(), torque_constant_);
           consecutive_errors = 0;
           first_error_logged = false;

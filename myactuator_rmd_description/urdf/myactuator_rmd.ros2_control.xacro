@@ -3,8 +3,9 @@
 
   <!-- ros2_control configuration for a given joint -->
   <xacro:macro name="myactuator_rmd_ros2_control" params="name joint_name simulation ifname actuator_id
-                                                          velocity_alpha effort_alpha 
-                                                          torque_constant timeout">
+                                                          velocity_alpha effort_alpha
+                                                          torque_constant timeout
+                                                          velocity_min_cutoff:=1.0 velocity_beta:=5.0 velocity_d_cutoff:=1.0">
     <ros2_control name="${name}" type="actuator">
       <hardware>
         <xacro:if value="${simulation}">
@@ -24,6 +25,10 @@
           <param name="effort_alpha">${effort_alpha}</param>
           <!-- Timeout of the actuator -->
           <param name="timeout">${timeout}</param>
+          <!-- 1-Euro velocity estimator parameters (used in motion mode) -->
+          <param name="velocity_min_cutoff">${velocity_min_cutoff}</param>
+          <param name="velocity_beta">${velocity_beta}</param>
+          <param name="velocity_d_cutoff">${velocity_d_cutoff}</param>
         </xacro:unless>
       </hardware>
       <joint name="${joint_name}">

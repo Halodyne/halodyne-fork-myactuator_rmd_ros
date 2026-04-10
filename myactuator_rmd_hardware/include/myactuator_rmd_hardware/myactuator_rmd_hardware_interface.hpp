@@ -28,10 +28,14 @@
 #include <rclcpp/duration.hpp>
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
+#include <rclcpp/node.hpp>
 #include <rclcpp/time.hpp>
 #include <rclcpp_lifecycle/state.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 
 #include "myactuator_rmd_hardware/low_pass_filter.hpp"
+#include "myactuator_rmd_hardware/velocity_estimators.hpp"
 #include "myactuator_rmd_hardware/visibility_control.hpp"
 
 
@@ -318,6 +322,16 @@ namespace myactuator_rmd_hardware {
 
       std::atomic<bool> motor_online_{false};
       std::atomic<bool> motor_first_reading_valid_{false};
+
+      // 1-Euro velocity estimator (encoder-based, used in motion mode)
+      rclcpp::Node::SharedPtr param_node_;
+      rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
+      std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> param_executor_;
+      std::thread param_spin_thread_;
+      std::unique_ptr<OneEuroEstimator> velocity_estimator_;
+
+      // Debug publisher for raw motion mode data
+      rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr motion_debug_pub_;
 
   };
 

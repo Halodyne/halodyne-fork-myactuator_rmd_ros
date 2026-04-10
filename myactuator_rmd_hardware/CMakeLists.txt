@@ -11,6 +11,7 @@ find_package(myactuator_rmd REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+find_package(std_msgs REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
   src/myactuator_rmd_hardware_interface.cpp
@@ -42,6 +43,7 @@ ament_target_dependencies(${PROJECT_NAME}
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  std_msgs
 )
 
 pluginlib_export_plugin_description_file(hardware_interface
