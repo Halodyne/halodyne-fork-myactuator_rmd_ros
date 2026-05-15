@@ -127,9 +127,6 @@ namespace myactuator_rmd_hardware {
         actuator_id_, e.what());
       motor_online_.store(false);
       motor_first_reading_valid_.store(false);
-      async_position_state_.store(std::numeric_limits<double>::quiet_NaN());
-      async_velocity_state_.store(std::numeric_limits<double>::quiet_NaN());
-      async_effort_state_.store(std::numeric_limits<double>::quiet_NaN());
     }
     // Parse 1-Euro filter parameters from URDF hardware parameters
     double oe_min_cutoff = 1.0;
@@ -503,9 +500,11 @@ namespace myactuator_rmd_hardware {
 
   hardware_interface::return_type MyActuatorRmdHardwareInterface::read(rclcpp::Time const& /*time*/,
     rclcpp::Duration const& /*period*/) {
-    position_state_ = async_position_state_.load();
-    velocity_state_ = async_velocity_state_.load();
-    effort_state_ = async_effort_state_.load();
+    if (motor_first_reading_valid_.load()) {
+      position_state_ = async_position_state_.load();
+      velocity_state_ = async_velocity_state_.load();
+      effort_state_ = async_effort_state_.load();
+    }
     return hardware_interface::return_type::OK;
   }
 
@@ -552,9 +551,6 @@ namespace myactuator_rmd_hardware {
     auto go_offline = [this, &offline_tick_counter]() {
       motor_online_.store(false);
       motor_first_reading_valid_.store(false);
-      async_position_state_.store(std::numeric_limits<double>::quiet_NaN());
-      async_velocity_state_.store(std::numeric_limits<double>::quiet_NaN());
-      async_effort_state_.store(std::numeric_limits<double>::quiet_NaN());
       offline_tick_counter = 0;
     };
 
