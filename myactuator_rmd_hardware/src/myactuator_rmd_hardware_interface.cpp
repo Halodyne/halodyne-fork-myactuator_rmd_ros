@@ -63,6 +63,17 @@ namespace myactuator_rmd_hardware {
       RCLCPP_FATAL(getLogger(), "Could not parse CAN actuator id!");
       return CallbackReturn::ERROR;
     }
+    if (info_.hardware_parameters.find("direction") != info_.hardware_parameters.end()) {
+      direction_sign_ = std::stod(info_.hardware_parameters["direction"]);
+      if (direction_sign_ != 1.0 && direction_sign_ != -1.0) {
+        RCLCPP_FATAL(getLogger(), "Hardware 'direction' must be +1.0 or -1.0, got '%f'!", direction_sign_);
+        return CallbackReturn::ERROR;
+      }
+      RCLCPP_INFO(getLogger(), "Using mounting direction sign '%+.1f'.", direction_sign_);
+    } else {
+      direction_sign_ = 1.0;
+      RCLCPP_INFO(getLogger(), "Mounting direction not set, defaulting to '%+.1f'.", direction_sign_);
+    }
     if (info_.hardware_parameters.find("torque_constant") != info_.hardware_parameters.end()) {
       torque_constant_ = std::stod(info_.hardware_parameters["torque_constant"]);
     } else {
@@ -615,9 +626,9 @@ namespace myactuator_rmd_hardware {
           if (effort_low_pass_filter_) {
             current_state = effort_low_pass_filter_->apply(current_state);
           }
-          async_position_state_.store(degToRad(position_state));
-          async_velocity_state_.store(degToRad(velocity_state));
-          async_effort_state_.store(currentToTorque(current_state, torque_constant_));
+          async_position_state_.store(direction_sign_ * degToRad(position_state));
+          async_velocity_state_.store(direction_sign_ * degToRad(velocity_state));
+          async_effort_state_.store(direction_sign_ * currentToTorque(current_state, torque_constant_));
           motor_first_reading_valid_.store(true);
           RCLCPP_INFO(getLogger(), "Motor %u first reading valid (pos=%.1f deg)", actuator_id_, position_state);
         } catch (const std::exception& e) {
@@ -631,11 +642,11 @@ namespace myactuator_rmd_hardware {
       // --- NORMAL OPERATION ---
       try {
         if (position_interface_running_) {
-          feedback_ = actuator_interface_->sendPositionAbsoluteSetpoint(radToDeg(async_position_command_.load()), max_velocity_);
+          feedback_ = actuator_interface_->sendPositionAbsoluteSetpoint(radToDeg(direction_sign_ * async_position_command_.load()), max_velocity_);
         } else if (velocity_interface_running_) {
-          feedback_ = actuator_interface_->sendVelocitySetpoint(radToDeg(async_velocity_command_.load()));
+          feedback_ = actuator_interface_->sendVelocitySetpoint(radToDeg(direction_sign_ * async_velocity_command_.load()));
         } else if (effort_interface_running_) {
-          feedback_ = actuator_interface_->sendTorqueSetpoint(async_effort_command_.load(), torque_constant_);
+          feedback_ = actuator_interface_->sendTorqueSetpoint(direction_sign_ * async_effort_command_.load(), torque_constant_);
         } else if (motion_interface_running_) {
           // Clamp kp/kd to [0, 4095] and cast to uint16_t
           auto clamp12 = [](double x) -> std::uint16_t {
@@ -652,7 +663,9 @@ namespace myactuator_rmd_hardware {
           // responses. This overlaps the motor processing time for the angle
           // request with the wait for the motion mode response, saving ~0.75ms
           // per cycle and enabling 500Hz operation.
-          motion_actuator_interface_->sendMotionModeControl(static_cast<float>(p), static_cast<float>(v), kp, kd, static_cast<float>(tff));
+          // Sign the canonical command into the motor frame (p, v, tff are
+          // the motion command; kp/kd are gains and must NOT be signed).
+          motion_actuator_interface_->sendMotionModeControl(static_cast<float>(direction_sign_ * p), static_cast<float>(direction_sign_ * v), kp, kd, static_cast<float>(direction_sign_ * tff));
           actuator_interface_->sendGetMultiTurnAngle();
           auto response = motion_actuator_interface_->recvMotionModeControl();
           auto const position = actuator_interface_->recvGetMultiTurnAngle();
@@ -681,10 +694,10 @@ namespace myactuator_rmd_hardware {
           }
 #endif
           auto const position_rad = degToRad(position);
-          async_position_state_.store(position_rad);
-          async_effort_state_.store(response.getTorque());
+          async_position_state_.store(direction_sign_ * position_rad);
+          async_effort_state_.store(direction_sign_ * response.getTorque());
           auto const velocity_rad = velocity_estimator_->update(position_rad);
-          async_velocity_state_.store(velocity_rad);
+          async_velocity_state_.store(direction_sign_ * velocity_rad);
           // Publish raw motion debug data: [cmd_pos, cmd_vel, raw_pos, raw_vel, torque]
           {
             std_msgs::msg::Float64MultiArray msg;
@@ -712,9 +725,9 @@ namespace myactuator_rmd_hardware {
         if (effort_low_pass_filter_) {
           current_state = effort_low_pass_filter_->apply(current_state);
         }
-        async_position_state_.store(degToRad(position_state));
-        async_velocity_state_.store(degToRad(velocity_state));
-        async_effort_state_.store(currentToTorque(current_state, torque_constant_));
+        async_position_state_.store(direction_sign_ * degToRad(position_state));
+        async_velocity_state_.store(direction_sign_ * degToRad(velocity_state));
+        async_effort_state_.store(direction_sign_ * currentToTorque(current_state, torque_constant_));
 
         consecutive_errors = 0;
         first_error_logged = false;
