@@ -17,7 +17,7 @@
           <param name="ifname">${ifname}</param>
           <!-- The id used for the CAN communication -->
           <param name="actuator_id">${actuator_id}</param>
-          <!-- Hardware mounting sign: joint_state = direction * raw, motor_cmd = direction * canonical -->
+          <!-- Hardware mounting sign (read joint_state = direction*raw, write motor_cmd = direction*canonical) -->
           <param name="direction">${direction}</param>
           <!-- Torque constant of the actuator -->
           <param name="torque_constant">${torque_constant}</param>
