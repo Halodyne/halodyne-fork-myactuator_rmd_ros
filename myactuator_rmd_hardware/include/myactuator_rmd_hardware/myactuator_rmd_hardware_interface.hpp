@@ -271,6 +271,10 @@ namespace myactuator_rmd_hardware {
       
       std::string ifname_;
       std::uint32_t actuator_id_;
+      // Hardware-level mounting sign: maps between the motor frame and the
+      // canonical ROS-side convention. read: joint_state = direction_sign_ *
+      // raw; write: motor_cmd = direction_sign_ * canonical. +-1.0 only.
+      double direction_sign_{1.0};
       double torque_constant_;
       double max_velocity_;
       std::chrono::milliseconds timeout_;
