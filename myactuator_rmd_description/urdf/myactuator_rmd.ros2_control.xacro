@@ -5,6 +5,7 @@
   <xacro:macro name="myactuator_rmd_ros2_control" params="name joint_name simulation ifname actuator_id
                                                           velocity_alpha effort_alpha
                                                           torque_constant timeout direction:=1.0
+                                                          max_current:=15.0
                                                           velocity_min_cutoff:=1.0 velocity_beta:=5.0 velocity_d_cutoff:=1.0">
     <ros2_control name="${name}" type="actuator">
       <hardware>
@@ -21,6 +22,9 @@
           <param name="direction">${direction}</param>
           <!-- Torque constant of the actuator -->
           <param name="torque_constant">${torque_constant}</param>
+          <!-- Per-actuator current clamp [A] for the effort branch: the primary,
+               kt-independent hard safety guard (ADR 0008). Applied after Nm->A. -->
+          <param name="max_current">${max_current}</param>
           <!-- Low-pass filter constant for velocity -->
           <param name="velocity_alpha">${velocity_alpha}</param>
           <!-- Low-pass filter constant for effort -->
