@@ -41,5 +41,7 @@ The `ifname` has to correspond to the name of the CAN interface as shown by `$ i
 | ------------------------------------------------------------ | ------------------------------------------------------------ |
 | ![Effort and velocity without low-pass filter](./media/without_low_pass_filter.png) | ![Effort and velocity with low-pass filter](./media/with_low_pass_filter.png) |
 
+> **Note:** `effort_alpha` does **not** apply on the pipelined host-torque path (i.e. while the `effort` command interface is active). On that path the effort state is exported as **raw current** converted to torque, without the low-pass filter, matching the motion-mode branch. The `effort_alpha` filter only affects the effort state read in the idle/status-polling path. If a downstream safety monitor consumes the effort state expecting filtering, account for this.
+
 Similarly the cycle-time for the asynchronous thread interfacing the actuator through CAN can be specified. For examples refer to the `myactuator_rmd_description` package.
 

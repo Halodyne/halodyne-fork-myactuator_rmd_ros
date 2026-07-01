@@ -32,6 +32,7 @@
 #include <rclcpp/node.hpp>
 #include <rclcpp/time.hpp>
 #include <rclcpp_lifecycle/state.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 
 #include "myactuator_rmd_hardware/low_pass_filter.hpp"
@@ -276,6 +277,7 @@ namespace myactuator_rmd_hardware {
       // raw; write: motor_cmd = direction_sign_ * canonical. +-1.0 only.
       double direction_sign_{1.0};
       double torque_constant_;
+      double max_current_;  // effort-branch current clamp [A] (kt-independent guard, ADR 0008)
       double max_velocity_;
       std::chrono::milliseconds timeout_;
 
@@ -326,6 +328,11 @@ namespace myactuator_rmd_hardware {
 
       std::atomic<bool> motor_online_{false};
       std::atomic<bool> motor_first_reading_valid_{false};
+      // Latched true once the motor has produced at least one valid reading.
+      // Lets read() tell "never online yet" (startup) apart from "was online, now
+      // dropped out" so it can export NaN state on drop-out and drive the core to
+      // FAULT rather than freezing the last finite value (ADR 0008 mitigation).
+      std::atomic<bool> ever_valid_reading_{false};
 
       // 1-Euro velocity estimator (encoder-based, used in motion mode)
       rclcpp::Node::SharedPtr param_node_;
@@ -336,6 +343,12 @@ namespace myactuator_rmd_hardware {
 
       // Debug publisher for raw motion mode data
       rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr motion_debug_pub_;
+
+      // Raw multi-turn encoder position as received from the driver each async
+      // read, stamped at receive time. Feeds offline tuning of the velocity
+      // estimate filter (the OneEuroEstimator assumes a fixed dt; this carries
+      // the real per-sample timing the broadcaster-decimated /joint_states loses).
+      rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr raw_encoder_pub_;
 
   };
 

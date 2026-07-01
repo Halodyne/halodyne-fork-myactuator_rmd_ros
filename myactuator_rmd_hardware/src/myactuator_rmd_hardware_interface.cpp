@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -32,6 +33,7 @@
 #include <rclcpp/node.hpp>
 #include <rclcpp/time.hpp>
 #include <rclcpp_lifecycle/state.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 
 
 #include "myactuator_rmd_hardware/conversions.hpp"
@@ -79,6 +81,15 @@ namespace myactuator_rmd_hardware {
     } else {
       torque_constant_ = std::numeric_limits<double>::quiet_NaN();
       RCLCPP_ERROR(getLogger(), "Could not parse torque constant, won't be able to use torque interface!");
+    }
+    // Per-actuator current clamp (A) applied after the Nm->A conversion in the
+    // effort branch: the primary, kt-independent hard safety guard (ADR 0008).
+    if (info_.hardware_parameters.find("max_current") != info_.hardware_parameters.end()) {
+      max_current_ = std::stod(info_.hardware_parameters["max_current"]);
+      RCLCPP_INFO(getLogger(), "Using effort current clamp max_current='%f' A.", max_current_);
+    } else {
+      max_current_ = 15.0;
+      RCLCPP_WARN(getLogger(), "max_current not set, defaulting to '%f' A (kt-independent hard current guard).", max_current_);
     }
     if (info_.hardware_parameters.find("max_velocity") != info_.hardware_parameters.end()) {
       max_velocity_ = std::stod(info_.hardware_parameters["max_velocity"]);
@@ -164,6 +175,8 @@ namespace myactuator_rmd_hardware {
     param_node_ = rclcpp::Node::make_shared("motor_" + id_str + "_params");
     motion_debug_pub_ = param_node_->create_publisher<std_msgs::msg::Float64MultiArray>(
       "motor_" + id_str + "_motion_raw", 10);
+    raw_encoder_pub_ = param_node_->create_publisher<sensor_msgs::msg::JointState>(
+      "motor_" + id_str + "_encoder_raw", 10);
     param_node_->declare_parameter("velocity_min_cutoff", oe_min_cutoff);
     param_node_->declare_parameter("velocity_beta", oe_beta);
     param_node_->declare_parameter("velocity_d_cutoff", oe_d_cutoff);
@@ -498,6 +511,21 @@ namespace myactuator_rmd_hardware {
       } else if (start_interface == info_.joints.at(0).name + "/" + hardware_interface::HW_IF_EFFORT) {
         effort_interface_running_.store(true);
         RCLCPP_INFO(getLogger(), "Starting effort interface...");
+        // Host-torque (effort) puts the whole control loop on the host: on a host
+        // stall the motor holds its last commanded current unless the motor's own
+        // 0xB3 comm-interruption protection (timeout_) is armed to autonomously
+        // drop current (ADR 0008 comm-timeout backstop). Warn loudly if it is
+        // disabled so running host-torque without the hardware backstop is never
+        // silent. Set a nonzero `timeout` hardware param (recommended >= 200 ms;
+        // see the halo_1 bring-up README) to arm it.
+        if (timeout_ == std::chrono::milliseconds(0)) {
+          RCLCPP_WARN(getLogger(),
+            "Motor %u: effort (host-torque) interface started but the 0xB3 CAN "
+            "comm-timeout backstop is DISABLED (timeout=0). A host stall will hold "
+            "the last commanded current. Set a nonzero `timeout` hardware param "
+            "(recommended >= 200 ms) before enabling host-torque on hardware.",
+            actuator_id_);
+        }
       }
     }
 
@@ -515,6 +543,21 @@ namespace myactuator_rmd_hardware {
       position_state_ = async_position_state_.load();
       velocity_state_ = async_velocity_state_.load();
       effort_state_ = async_effort_state_.load();
+    } else if (ever_valid_reading_.load()) {
+      // The motor was online and producing valid readings but has since dropped
+      // out (repeated CAN errors -> go_offline(), or a lost reply). Rather than
+      // freezing the last finite joint state forever (which lets HalodyneCore keep
+      // treating a dead axis as healthy and lets the host-torque controller keep
+      // driving against a stale encoder), export NaN so the exported /joint_states
+      // go non-finite. HalodyneCore's existing bad-state fault path then trips
+      // (its joint_state_callback rejects NaN positions -> the state ages out ->
+      // MotionLoopState::FAULT), the same path a stale/absent joint state uses
+      // (ADR 0008 mitigation: bad-state -> explicit FAULT, not a silent hold).
+      // When the motor comes back (first reading valid again) real values resume
+      // and the core recovers FAULT -> RUNNING on its own.
+      position_state_ = std::numeric_limits<double>::quiet_NaN();
+      velocity_state_ = std::numeric_limits<double>::quiet_NaN();
+      effort_state_ = std::numeric_limits<double>::quiet_NaN();
     }
     return hardware_interface::return_type::OK;
   }
@@ -571,11 +614,42 @@ namespace myactuator_rmd_hardware {
         RCLCPP_WARN(getLogger(), "Motor %u CAN error: %s", actuator_id_, e.what());
         first_error_logged = true;
       }
+      // Drain any straggler reply left in driver_'s receive buffer after this
+      // error. The host-torque (effort) branch pipelines the 0xA1 torque and
+      // 0x92 angle replies onto the single driver_ socket; if the 0x92 arrives
+      // after the recv timeout that raised this error, it would otherwise linger
+      // and be read as the *next* cycle's angle, silently desyncing angle/velocity
+      // for the rest of the run. Flushing here restarts every cycle from a clean
+      // buffer. Only driver_ is drained; the motion branch's 0x500 reply lives on
+      // motion_driver_ and is untouched.
+      if (actuator_interface_) {
+        try {
+          actuator_interface_->flushReceiveBuffer();
+        } catch (const std::exception& flush_e) {
+          RCLCPP_WARN(getLogger(), "Motor %u receive-buffer flush failed: %s", actuator_id_, flush_e.what());
+        }
+      }
       if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
         RCLCPP_ERROR(getLogger(), "Motor %u went offline after %d consecutive errors",
           actuator_id_, MAX_CONSECUTIVE_ERRORS);
         go_offline();
       }
+    };
+
+    // Raw encoder position publisher. position_rad is the unsigned, motor-frame
+    // multi-turn angle exactly as received and fed into the velocity estimator,
+    // stamped at receive time so the velocity-estimate filter can be tuned or
+    // replayed offline against the true sample timing.
+    std::string const joint_name {info_.joints.empty() ? std::string{} : info_.joints.at(0).name};
+    auto publish_raw_encoder = [this, joint_name](double const position_rad) {
+      if (!raw_encoder_pub_) {
+        return;
+      }
+      sensor_msgs::msg::JointState msg;
+      msg.header.stamp = param_node_->now();
+      msg.name = {joint_name};
+      msg.position = {position_rad};
+      raw_encoder_pub_->publish(msg);
     };
 
 #ifdef MYACTUATOR_RMD_HARDWARE__ASYNC_LOOP_STATS
@@ -630,6 +704,11 @@ namespace myactuator_rmd_hardware {
           async_velocity_state_.store(direction_sign_ * degToRad(velocity_state));
           async_effort_state_.store(direction_sign_ * currentToTorque(current_state, torque_constant_));
           motor_first_reading_valid_.store(true);
+          // Latch that this motor has produced at least one valid reading. read()
+          // uses this to distinguish "never online yet" (startup: leave defaults,
+          // core stays in INIT) from "was online, now dropped out" (export NaN so
+          // the core faults). See read() (ADR 0008 bad-state -> FAULT mitigation).
+          ever_valid_reading_.store(true);
           RCLCPP_INFO(getLogger(), "Motor %u first reading valid (pos=%.1f deg)", actuator_id_, position_state);
         } catch (const std::exception& e) {
           RCLCPP_WARN(getLogger(), "Motor %u first reading failed: %s", actuator_id_, e.what());
@@ -646,7 +725,58 @@ namespace myactuator_rmd_hardware {
         } else if (velocity_interface_running_) {
           feedback_ = actuator_interface_->sendVelocitySetpoint(radToDeg(direction_sign_ * async_velocity_command_.load()));
         } else if (effort_interface_running_) {
-          feedback_ = actuator_interface_->sendTorqueSetpoint(direction_sign_ * async_effort_command_.load(), torque_constant_);
+          // Pipelined host-torque: send the torque command (0xA1) and the fine
+          // angle read (0x92) back-to-back, then collect both replies dispatched
+          // by command byte. This overlaps the two round-trip latencies (like the
+          // motion branch below), saving ~0.75ms per cycle and enabling 500Hz.
+          // Sign the canonical effort command into the motor frame (ADR 0006:
+          // write = direction * canonical). The 0x92 angle is read back and
+          // un-signed on state export (read = direction * raw), exactly as motion.
+          auto const effort_cmd = async_effort_command_.load();
+          actuator_interface_->sendTorqueSetpointAsync(direction_sign_ * effort_cmd, torque_constant_, max_current_);
+          actuator_interface_->sendGetMultiTurnAngle();
+          auto const torque_angle = actuator_interface_->recvTorqueAndAngle();
+#ifdef MYACTUATOR_RMD_HARDWARE__ASYNC_LOOP_STATS
+          {
+            auto const io_end {std::chrono::steady_clock::now()};
+            double const io_us {std::chrono::duration<double, std::micro>(io_end - now).count()};
+            total_io_us += io_us;
+            if (io_us > max_io_us) max_io_us = io_us;
+            ++loop_count;
+            if (io_end > wakeup_time) ++overrun_count;
+            if (io_end - stats_start >= stats_interval) {
+              double const actual_rate = static_cast<double>(loop_count) /
+                std::chrono::duration<double>(io_end - stats_start).count();
+              RCLCPP_INFO(getLogger(),
+                "Async loop [id=%u]: rate=%.1f Hz, io_mean=%.0f us, io_max=%.0f us, overruns=%lu/%lu (%.1f%%)",
+                actuator_id_, actual_rate, total_io_us / loop_count, max_io_us,
+                overrun_count, loop_count,
+                100.0 * static_cast<double>(overrun_count) / loop_count);
+              loop_count = 0;
+              overrun_count = 0;
+              total_io_us = 0.0;
+              max_io_us = 0.0;
+              stats_start = io_end;
+            }
+          }
+#endif
+          auto const position_rad = degToRad(torque_angle.angle);
+          async_position_state_.store(direction_sign_ * position_rad);
+          // Effort state on the pipelined host-torque path is RAW current (the
+          // effort_alpha / effort_low_pass_filter_ is intentionally NOT applied
+          // here, matching the motion branch). See the effort_alpha note in the
+          // hardware README.
+          async_effort_state_.store(direction_sign_ * currentToTorque(torque_angle.feedback.current, torque_constant_));
+          publish_raw_encoder(position_rad);
+          auto const velocity_rad = velocity_estimator_->update(position_rad);
+          async_velocity_state_.store(direction_sign_ * velocity_rad);
+          feedback_.shaft_angle = torque_angle.angle;
+          feedback_.shaft_speed = radToDeg(velocity_rad);
+          feedback_.current = torque_angle.feedback.current;
+          consecutive_errors = 0;
+          first_error_logged = false;
+          std::this_thread::sleep_until(wakeup_time);
+          continue;
         } else if (motion_interface_running_) {
           // Clamp kp/kd to [0, 4095] and cast to uint16_t
           auto clamp12 = [](double x) -> std::uint16_t {
@@ -696,6 +826,7 @@ namespace myactuator_rmd_hardware {
           auto const position_rad = degToRad(position);
           async_position_state_.store(direction_sign_ * position_rad);
           async_effort_state_.store(direction_sign_ * response.getTorque());
+          publish_raw_encoder(position_rad);
           auto const velocity_rad = velocity_estimator_->update(position_rad);
           async_velocity_state_.store(direction_sign_ * velocity_rad);
           // Publish raw motion debug data: [cmd_pos, cmd_vel, raw_pos, raw_vel, torque]
@@ -717,6 +848,7 @@ namespace myactuator_rmd_hardware {
         }
 
         double const position_state {feedback_.shaft_angle};
+        publish_raw_encoder(degToRad(position_state));
         double velocity_state {feedback_.shaft_speed};
         if (velocity_low_pass_filter_) {
           velocity_state = velocity_low_pass_filter_->apply(velocity_state);
