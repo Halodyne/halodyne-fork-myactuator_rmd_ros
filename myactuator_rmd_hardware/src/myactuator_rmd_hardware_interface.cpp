@@ -210,9 +210,7 @@ namespace myactuator_rmd_hardware {
     if (param_spin_thread_.joinable()) {
       param_spin_thread_.join();
     }
-    if (actuator_interface_) {
-      actuator_interface_->shutdownMotor();
-    }
+    stopActuatorSafely(true, "on_cleanup");
     return CallbackReturn::SUCCESS;
   }
 
@@ -224,9 +222,7 @@ namespace myactuator_rmd_hardware {
     if (param_spin_thread_.joinable()) {
       param_spin_thread_.join();
     }
-    if (actuator_interface_) {
-      actuator_interface_->shutdownMotor();
-    }
+    stopActuatorSafely(true, "on_shutdown");
     return CallbackReturn::SUCCESS;
   }
 
@@ -237,19 +233,20 @@ namespace myactuator_rmd_hardware {
 
   CallbackReturn MyActuatorRmdHardwareInterface::on_deactivate(rclcpp_lifecycle::State const& /*previous_state*/) {
     stopAsyncThread();
-    if (actuator_interface_) {
-      actuator_interface_->stopMotor();
-    }
-    RCLCPP_INFO(getLogger(), "Actuator successfully stopped!");
+    stopActuatorSafely(false, "on_deactivate");
     return CallbackReturn::SUCCESS;
   }
   
   CallbackReturn MyActuatorRmdHardwareInterface::on_error(rclcpp_lifecycle::State const& /*previous_state*/) {
     stopAsyncThread();
+    stopActuatorSafely(false, "on_error");
     if (actuator_interface_) {
-      actuator_interface_->stopMotor();
-      actuator_interface_->reset();
-      RCLCPP_INFO(getLogger(), "Actuator reset!");
+      try {
+        actuator_interface_->reset();
+        RCLCPP_INFO(getLogger(), "Actuator reset!");
+      } catch (const std::exception& e) {
+        RCLCPP_ERROR(getLogger(), "Motor %u: reset failed in on_error: %s", actuator_id_, e.what());
+      }
     }
     return CallbackReturn::SUCCESS;
   }
@@ -741,7 +738,11 @@ namespace myactuator_rmd_hardware {
 
       std::this_thread::sleep_until(wakeup_time);
     }
-    actuator_interface_->setTimeout(std::chrono::milliseconds(0));
+    // The 0xB3 backstop is deliberately NOT cleared here. Clearing it before
+    // the stop command (as this used to) left a torque-mode motor with no
+    // backstop if the stop then failed, and an unguarded throw here (silent
+    // motor) terminated the process. stopActuatorSafely() sends the stop first
+    // and clears the backstop after, with every call guarded.
     return;
   }
 
@@ -783,6 +784,46 @@ namespace myactuator_rmd_hardware {
 #endif  // MYACTUATOR_RMD_HARDWARE__THREAD_PRIORITY
 
     return true;
+  }
+
+  void MyActuatorRmdHardwareInterface::stopActuatorSafely(bool shutdown, char const* context) noexcept {
+    if (!actuator_interface_) {
+      return;
+    }
+    // 1. Stop first. A motor that does not answer leaves its last command
+    //    running; there is nothing more the host can do over CAN, but it must
+    //    not abort the process, so the remaining actuators still get theirs.
+    bool stopped = false;
+    try {
+      if (shutdown) {
+        actuator_interface_->shutdownMotor();
+      } else {
+        actuator_interface_->stopMotor();
+      }
+      stopped = true;
+      RCLCPP_INFO(getLogger(), "Motor %u: %s sent (%s).", actuator_id_,
+        shutdown ? "shutdown" : "stop", context);
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(getLogger(), "Motor %u: %s FAILED in %s: %s. The motor may still be "
+        "executing its last command.", actuator_id_, shutdown ? "shutdown" : "stop", context, e.what());
+    } catch (...) {
+      RCLCPP_ERROR(getLogger(), "Motor %u: %s FAILED in %s (unknown exception). The motor may "
+        "still be executing its last command.", actuator_id_, shutdown ? "shutdown" : "stop", context);
+    }
+    // 2. Only after a successful stop, clear the 0xB3 comm-timeout backstop.
+    //    If the stop failed, leave the backstop armed: in host-torque mode it is
+    //    what drops the motor's current once the host goes quiet.
+    if (!stopped || timeout_ == std::chrono::milliseconds(0)) {
+      return;
+    }
+    try {
+      actuator_interface_->setTimeout(std::chrono::milliseconds(0));
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(getLogger(), "Motor %u: clearing the comm timeout failed in %s: %s",
+        actuator_id_, context, e.what());
+    } catch (...) {
+      RCLCPP_WARN(getLogger(), "Motor %u: clearing the comm timeout failed in %s.", actuator_id_, context);
+    }
   }
 
   void MyActuatorRmdHardwareInterface::stopAsyncThread() {

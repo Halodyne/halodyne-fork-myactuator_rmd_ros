@@ -268,6 +268,26 @@ namespace myactuator_rmd_hardware {
        *    Stop the asynchronous command thread used to communicate with the hardware
       */
       void stopAsyncThread();
+
+      /**\fn stopActuatorSafely
+       * \brief
+       *    Bring the actuator to a safe state on the way down. Must be called
+       *    after stopAsyncThread() so it never races the async thread on the bus.
+       *    Order matters: the stop (0x81) or shutdown (0x80) command goes out
+       *    FIRST, and only then is the 0xB3 communication-timeout backstop
+       *    cleared. Clearing it first would leave a torque-mode motor holding
+       *    torque with no backstop if the stop then failed. Every CAN call is
+       *    guarded: a silent or unplugged motor must not throw out of a
+       *    lifecycle callback or the destructor (std::terminate would abort the
+       *    whole controller manager and keep the OTHER actuators from getting
+       *    their stop).
+       *
+       * \param[in] shutdown
+       *    true sends shutdownMotor (0x80), false sends stopMotor (0x81)
+       * \param[in] context
+       *    Name of the calling callback, for the log
+      */
+      void stopActuatorSafely(bool shutdown, char const* context) noexcept;
       
       std::string ifname_;
       std::uint32_t actuator_id_;
