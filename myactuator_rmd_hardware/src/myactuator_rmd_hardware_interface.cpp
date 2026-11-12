@@ -194,6 +194,10 @@ namespace myactuator_rmd_hardware {
       param_executor_->spin();
     });
 
+    // A (re)configure starts a fresh async thread with fresh trust bookkeeping;
+    // the shared flags must not carry a previous configuration's "trusted".
+    motor_first_reading_valid_.store(false);
+    async_motor_state_.store(kMotorStateNeverOnline);
     stop_async_thread_.store(false);
     if (!startAsyncThread(cycle_time_)) {
       RCLCPP_FATAL(getLogger(), "Failed to start async thread!");
@@ -228,12 +232,26 @@ namespace myactuator_rmd_hardware {
   }
 
   CallbackReturn MyActuatorRmdHardwareInterface::on_activate(rclcpp_lifecycle::State const& /*previous_state*/) {
+    // on_deactivate stops the async thread; a later activate must restart it,
+    // through the settle guard and hold latch again (fresh locals), or the motor
+    // would sit with no loop while motor_state kept its last value.
+    if (!async_thread_.joinable()) {
+      motor_first_reading_valid_.store(false);
+      stop_async_thread_.store(false);
+      if (!startAsyncThread(cycle_time_)) {
+        RCLCPP_FATAL(getLogger(), "Failed to restart async thread on activate!");
+        return CallbackReturn::ERROR;
+      }
+    }
     RCLCPP_INFO(getLogger(), "Actuator successfully started!");
     return CallbackReturn::SUCCESS;
   }
 
   CallbackReturn MyActuatorRmdHardwareInterface::on_deactivate(rclcpp_lifecycle::State const& /*previous_state*/) {
     stopAsyncThread();
+    // No loop is running from here on: the position is no longer live.
+    motor_first_reading_valid_.store(false);
+    async_motor_state_.store(kMotorStateDropped);
     stopActuatorSafely(false, "on_deactivate");
     return CallbackReturn::SUCCESS;
   }
@@ -573,6 +591,10 @@ namespace myactuator_rmd_hardware {
     // or the boot-time zeros). Until the controller delivers a command that
     // differs from that snapshot, only a no-motion command is sent.
     bool hold_until_fresh = false;
+    // Canonical position (rad) captured at the trust edge: what the hold
+    // commands. Not async_position_state_, which in position mode is refreshed
+    // from the 0xA4 reply's whole-degree shaft_angle and would step the hold.
+    double trusted_position = 0.0;
     struct CommandSnapshot {
       double position, velocity, effort, mp, mv, mkp, mkd, mtff;
     } stale {};
@@ -662,6 +684,7 @@ namespace myactuator_rmd_hardware {
             // jump from a stale pre-dropout position.
             (void)velocity_estimator_->update(position_rad);
             (void)velocity_estimator_->update(position_rad);
+            trusted_position = direction_sign_ * position_rad;
             stale = snapshot_commands();
             hold_until_fresh = true;
             motor_first_reading_valid_.store(true);
@@ -695,6 +718,19 @@ namespace myactuator_rmd_hardware {
         } else if (effort_interface_running_) {
           fresh = differs(now_cmd.effort, stale.effort);
         }
+        // A buffered command that holds the measured position is safe to apply
+        // even if it equals the snapshot bit for bit (a short outage on an
+        // unmoved, balanced axis): it cannot slew. Without this the latch could
+        // stay set forever, leaving the axis limp while core believes it holds.
+        double const tol_rad {degToRad(ENCODER_SETTLE_TOLERANCE_DEG)};
+        auto holds_here = [&](double cmd) {
+          return std::isfinite(cmd) && std::abs(cmd - trusted_position) <= tol_rad;
+        };
+        if (!fresh && motion_interface_running_) {
+          fresh = holds_here(now_cmd.mp) && std::isfinite(now_cmd.mv) && std::abs(now_cmd.mv) < 1e-6;
+        } else if (!fresh && position_interface_running_) {
+          fresh = holds_here(now_cmd.position);
+        }
         if (fresh) {
           hold_until_fresh = false;
           RCLCPP_INFO(getLogger(), "Motor %u: fresh command received, hold released", actuator_id_);
@@ -705,7 +741,7 @@ namespace myactuator_rmd_hardware {
       try {
         // While the hold latch is set, every mode gets a no-motion command: the
         // measured (canonical) position, zero velocity/torque, zero gains.
-        double const held_position {async_position_state_.load()};
+        double const held_position {trusted_position};
         if (position_interface_running_) {
           double const cmd {hold_until_fresh ? held_position : async_position_command_.load()};
           feedback_ = actuator_interface_->sendPositionAbsoluteSetpoint(radToDeg(direction_sign_ * cmd), max_velocity_);
