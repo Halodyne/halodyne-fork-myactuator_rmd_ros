@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -40,6 +41,33 @@
 
 
 namespace myactuator_rmd_hardware {
+
+  /**\brief
+   *    Name of the per-joint state interface that reports motor liveness.
+   *    halodyne_core reads it off /dynamic_joint_states and refuses to treat an
+   *    actuator as ready unless it reads kMotorStateOnline. The values are exact
+   *    small integers carried as doubles.
+  */
+  inline constexpr char MOTOR_STATE_INTERFACE_NAME[] = "motor_state";
+  /// No trusted position has ever been read from this motor (boot with the bus
+  /// down or the motor unpowered). The published position is a placeholder.
+  inline constexpr double kMotorStateNeverOnline = 0.0;
+  /// The motor answers and its position is trusted.
+  inline constexpr double kMotorStateOnline = 1.0;
+  /// The motor was online and has stopped answering, or has come back but its
+  /// position is not trusted yet. The published position is the last trusted one.
+  inline constexpr double kMotorStateDropped = 2.0;
+
+  /**\brief
+   *    Encoder settle guard. A motor answers CAN before its absolute encoder is
+   *    ready, and for ~0.5 s every position register reads exactly 0.0
+   *    (measured 2026-09-09, both axes). Those readings agree with each other, so
+   *    sample agreement alone cannot reject them: the window is waited out by wall
+   *    time (3x the measured window), then two consecutive multi-turn samples must
+   *    agree. Until then the motor is not trusted and nothing is commanded.
+  */
+  inline constexpr std::chrono::milliseconds ENCODER_SETTLE_TIME {1500};
+  inline constexpr double ENCODER_SETTLE_TOLERANCE_DEG {0.5};
 
   /**\class MyActuatorRmdHardwareInterface
    * \brief
@@ -326,26 +354,30 @@ namespace myactuator_rmd_hardware {
       std::unique_ptr<myactuator_rmd::motion_mode::ActuatorInterface> motion_actuator_interface_;
       myactuator_rmd::Feedback feedback_;
       // Shared between the two threads
-      std::atomic<bool> stop_async_thread_;
+      std::atomic<bool> stop_async_thread_{false};
       
-      std::atomic<double> async_position_state_;
-      std::atomic<double> async_velocity_state_;
-      std::atomic<double> async_effort_state_;
-      std::atomic<double> async_position_command_;
-      std::atomic<double> async_velocity_command_;
-      std::atomic<double> async_effort_command_;
-      std::atomic<double> async_motion_p_command_;
-      std::atomic<double> async_motion_v_command_;
-      std::atomic<double> async_motion_kp_command_;
-      std::atomic<double> async_motion_kd_command_;
-      std::atomic<double> async_motion_tff_command_;
-      std::atomic<bool> position_interface_running_;
-      std::atomic<bool> velocity_interface_running_;
-      std::atomic<bool> effort_interface_running_;
-      std::atomic<bool> motion_interface_running_;
+      std::atomic<double> async_position_state_{0.0};
+      std::atomic<double> async_velocity_state_{0.0};
+      std::atomic<double> async_effort_state_{0.0};
+      std::atomic<double> async_position_command_{0.0};
+      std::atomic<double> async_velocity_command_{0.0};
+      std::atomic<double> async_effort_command_{0.0};
+      std::atomic<double> async_motion_p_command_{0.0};
+      std::atomic<double> async_motion_v_command_{0.0};
+      std::atomic<double> async_motion_kp_command_{0.0};
+      std::atomic<double> async_motion_kd_command_{0.0};
+      std::atomic<double> async_motion_tff_command_{0.0};
+      std::atomic<bool> position_interface_running_{false};
+      std::atomic<bool> velocity_interface_running_{false};
+      std::atomic<bool> effort_interface_running_{false};
+      std::atomic<bool> motion_interface_running_{false};
 
       std::atomic<bool> motor_online_{false};
       std::atomic<bool> motor_first_reading_valid_{false};
+      // Liveness published on the motor_state interface (see the kMotorState*
+      // constants). Written by the async thread, read into motor_state_ by read().
+      std::atomic<double> async_motor_state_{kMotorStateNeverOnline};
+      double motor_state_{kMotorStateNeverOnline};
 
       // 1-Euro velocity estimator (encoder-based, used in motion mode)
       rclcpp::Node::SharedPtr param_node_;
