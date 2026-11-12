@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -193,6 +194,10 @@ namespace myactuator_rmd_hardware {
       param_executor_->spin();
     });
 
+    // A (re)configure starts a fresh async thread with fresh trust bookkeeping;
+    // the shared flags must not carry a previous configuration's "trusted".
+    motor_first_reading_valid_.store(false);
+    async_motor_state_.store(kMotorStateNeverOnline);
     stop_async_thread_.store(false);
     if (!startAsyncThread(cycle_time_)) {
       RCLCPP_FATAL(getLogger(), "Failed to start async thread!");
@@ -227,12 +232,26 @@ namespace myactuator_rmd_hardware {
   }
 
   CallbackReturn MyActuatorRmdHardwareInterface::on_activate(rclcpp_lifecycle::State const& /*previous_state*/) {
+    // on_deactivate stops the async thread; a later activate must restart it,
+    // through the settle guard and hold latch again (fresh locals), or the motor
+    // would sit with no loop while motor_state kept its last value.
+    if (!async_thread_.joinable()) {
+      motor_first_reading_valid_.store(false);
+      stop_async_thread_.store(false);
+      if (!startAsyncThread(cycle_time_)) {
+        RCLCPP_FATAL(getLogger(), "Failed to restart async thread on activate!");
+        return CallbackReturn::ERROR;
+      }
+    }
     RCLCPP_INFO(getLogger(), "Actuator successfully started!");
     return CallbackReturn::SUCCESS;
   }
 
   CallbackReturn MyActuatorRmdHardwareInterface::on_deactivate(rclcpp_lifecycle::State const& /*previous_state*/) {
     stopAsyncThread();
+    // No loop is running from here on: the position is no longer live.
+    motor_first_reading_valid_.store(false);
+    async_motor_state_.store(kMotorStateDropped);
     stopActuatorSafely(false, "on_deactivate");
     return CallbackReturn::SUCCESS;
   }
@@ -332,6 +351,11 @@ namespace myactuator_rmd_hardware {
     state_interfaces.emplace_back(hardware_interface::StateInterface(
       info_.joints.at(0).name, hardware_interface::HW_IF_EFFORT, &effort_state_)
     );
+    // Liveness for halodyne_core (see MOTOR_STATE_INTERFACE_NAME). Exported in
+    // addition to the URDF-declared position/velocity/effort; the joint state
+    // broadcaster carries it on /dynamic_joint_states.
+    state_interfaces.emplace_back(hardware_interface::StateInterface(
+      info_.joints.at(0).name, MOTOR_STATE_INTERFACE_NAME, &motor_state_));
     return state_interfaces;
   }
 
@@ -508,6 +532,7 @@ namespace myactuator_rmd_hardware {
 
   hardware_interface::return_type MyActuatorRmdHardwareInterface::read(rclcpp::Time const& /*time*/,
     rclcpp::Duration const& /*period*/) {
+    motor_state_ = async_motor_state_.load();
     if (motor_first_reading_valid_.load()) {
       position_state_ = async_position_state_.load();
       velocity_state_ = async_velocity_state_.load();
@@ -556,9 +581,35 @@ namespace myactuator_rmd_hardware {
     int offline_tick_counter = 0;
     int const probe_interval_ticks = std::max(1, static_cast<int>(500 / cycle_time.count()));
 
-    auto go_offline = [this, &offline_tick_counter]() {
+    // Liveness / trust bookkeeping (async thread only).
+    bool ever_trusted = false;            // a position has been trusted at least once
+    auto online_since {std::chrono::steady_clock::now()};  // when the motor (re)started answering
+    bool have_settle_sample = false;
+    double settle_prev_deg = 0.0;
+    // Hold latch: after a position is (re)trusted, the command buffers may still
+    // hold whatever was there before (a pre-dropout target with non-zero gains,
+    // or the boot-time zeros). Until the controller delivers a command that
+    // differs from that snapshot, only a no-motion command is sent.
+    bool hold_until_fresh = false;
+    // Canonical position (rad) captured at the trust edge: what the hold
+    // commands. Not async_position_state_, which in position mode is refreshed
+    // from the 0xA4 reply's whole-degree shaft_angle and would step the hold.
+    double trusted_position = 0.0;
+    struct CommandSnapshot {
+      double position, velocity, effort, mp, mv, mkp, mkd, mtff;
+    } stale {};
+    auto snapshot_commands = [this]() {
+      return CommandSnapshot{
+        async_position_command_.load(), async_velocity_command_.load(), async_effort_command_.load(),
+        async_motion_p_command_.load(), async_motion_v_command_.load(), async_motion_kp_command_.load(),
+        async_motion_kd_command_.load(), async_motion_tff_command_.load()};
+    };
+
+    auto go_offline = [this, &offline_tick_counter, &ever_trusted, &have_settle_sample]() {
       motor_online_.store(false);
       motor_first_reading_valid_.store(false);
+      async_motor_state_.store(ever_trusted ? kMotorStateDropped : kMotorStateNeverOnline);
+      have_settle_sample = false;
       offline_tick_counter = 0;
     };
 
@@ -599,9 +650,12 @@ namespace myactuator_rmd_hardware {
             actuator_interface_->setTimeout(timeout_);
             motor_online_.store(true);
             motor_first_reading_valid_.store(false);
+            online_since = std::chrono::steady_clock::now();
+            have_settle_sample = false;
             consecutive_errors = 0;
             first_error_logged = false;
-            RCLCPP_INFO(getLogger(), "Motor %u came online", actuator_id_);
+            RCLCPP_INFO(getLogger(), "Motor %u is answering; waiting %ld ms for the encoder to settle "
+              "before trusting its position", actuator_id_, static_cast<long>(ENCODER_SETTLE_TIME.count()));
           } catch (...) {
             // Still offline
           }
@@ -610,40 +664,93 @@ namespace myactuator_rmd_hardware {
         continue;
       }
 
-      // --- FIRST READING: read position only, no command ---
+      // --- SETTLE + FIRST TRUSTED READING: read only, never command ---
+      // The multi-turn register is the source: getMotorStatus2().shaft_angle is
+      // whole degrees and was the field that reported the power-up 0.0.
       if (!motor_first_reading_valid_.load()) {
         try {
-          feedback_ = actuator_interface_->getMotorStatus2();
-          double const position_state {feedback_.shaft_angle};
-          double velocity_state {feedback_.shaft_speed};
-          if (velocity_low_pass_filter_) {
-            velocity_state = velocity_low_pass_filter_->apply(velocity_state);
+          double const angle_deg {static_cast<double>(actuator_interface_->getMultiTurnAngle())};
+          bool const settled_by_time {std::chrono::steady_clock::now() - online_since >= ENCODER_SETTLE_TIME};
+          bool const agrees {have_settle_sample &&
+            std::abs(angle_deg - settle_prev_deg) <= ENCODER_SETTLE_TOLERANCE_DEG};
+          settle_prev_deg = angle_deg;
+          have_settle_sample = true;
+          if (settled_by_time && agrees && std::isfinite(angle_deg)) {
+            double const position_rad {degToRad(angle_deg)};
+            async_position_state_.store(direction_sign_ * position_rad);
+            async_velocity_state_.store(0.0);
+            async_effort_state_.store(0.0);
+            // Prime the velocity estimator so the first normal cycle does not see a
+            // jump from a stale pre-dropout position.
+            (void)velocity_estimator_->update(position_rad);
+            (void)velocity_estimator_->update(position_rad);
+            trusted_position = direction_sign_ * position_rad;
+            stale = snapshot_commands();
+            hold_until_fresh = true;
+            motor_first_reading_valid_.store(true);
+            async_motor_state_.store(kMotorStateOnline);
+            RCLCPP_INFO(getLogger(), "Motor %u position trusted (%.2f deg)%s; holding until a fresh command arrives",
+              actuator_id_, angle_deg, ever_trusted ? " after reconnect" : "");
+            ever_trusted = true;
           }
-          double current_state {feedback_.current};
-          if (effort_low_pass_filter_) {
-            current_state = effort_low_pass_filter_->apply(current_state);
-          }
-          async_position_state_.store(direction_sign_ * degToRad(position_state));
-          async_velocity_state_.store(direction_sign_ * degToRad(velocity_state));
-          async_effort_state_.store(direction_sign_ * currentToTorque(current_state, torque_constant_));
-          motor_first_reading_valid_.store(true);
-          RCLCPP_INFO(getLogger(), "Motor %u first reading valid (pos=%.1f deg)", actuator_id_, position_state);
         } catch (const std::exception& e) {
-          RCLCPP_WARN(getLogger(), "Motor %u first reading failed: %s", actuator_id_, e.what());
+          RCLCPP_WARN(getLogger(), "Motor %u reading during settle failed: %s", actuator_id_, e.what());
           go_offline();
         }
         std::this_thread::sleep_until(wakeup_time);
         continue;
       }
 
+      // Release the hold latch once the controller has written a command that
+      // differs from the snapshot taken when the position was trusted.
+      if (hold_until_fresh) {
+        auto const now_cmd = snapshot_commands();
+        auto differs = [](double a, double b) { return std::isfinite(a) && a != b; };
+        bool fresh {false};
+        if (motion_interface_running_) {
+          fresh = differs(now_cmd.mp, stale.mp) || differs(now_cmd.mv, stale.mv) ||
+                  differs(now_cmd.mkp, stale.mkp) || differs(now_cmd.mkd, stale.mkd) ||
+                  differs(now_cmd.mtff, stale.mtff);
+        } else if (position_interface_running_) {
+          fresh = differs(now_cmd.position, stale.position);
+        } else if (velocity_interface_running_) {
+          fresh = differs(now_cmd.velocity, stale.velocity);
+        } else if (effort_interface_running_) {
+          fresh = differs(now_cmd.effort, stale.effort);
+        }
+        // A buffered command that holds the measured position is safe to apply
+        // even if it equals the snapshot bit for bit (a short outage on an
+        // unmoved, balanced axis): it cannot slew. Without this the latch could
+        // stay set forever, leaving the axis limp while core believes it holds.
+        double const tol_rad {degToRad(ENCODER_SETTLE_TOLERANCE_DEG)};
+        auto holds_here = [&](double cmd) {
+          return std::isfinite(cmd) && std::abs(cmd - trusted_position) <= tol_rad;
+        };
+        if (!fresh && motion_interface_running_) {
+          fresh = holds_here(now_cmd.mp) && std::isfinite(now_cmd.mv) && std::abs(now_cmd.mv) < 1e-6;
+        } else if (!fresh && position_interface_running_) {
+          fresh = holds_here(now_cmd.position);
+        }
+        if (fresh) {
+          hold_until_fresh = false;
+          RCLCPP_INFO(getLogger(), "Motor %u: fresh command received, hold released", actuator_id_);
+        }
+      }
+
       // --- NORMAL OPERATION ---
       try {
+        // While the hold latch is set, every mode gets a no-motion command: the
+        // measured (canonical) position, zero velocity/torque, zero gains.
+        double const held_position {trusted_position};
         if (position_interface_running_) {
-          feedback_ = actuator_interface_->sendPositionAbsoluteSetpoint(radToDeg(direction_sign_ * async_position_command_.load()), max_velocity_);
+          double const cmd {hold_until_fresh ? held_position : async_position_command_.load()};
+          feedback_ = actuator_interface_->sendPositionAbsoluteSetpoint(radToDeg(direction_sign_ * cmd), max_velocity_);
         } else if (velocity_interface_running_) {
-          feedback_ = actuator_interface_->sendVelocitySetpoint(radToDeg(direction_sign_ * async_velocity_command_.load()));
+          double const cmd {hold_until_fresh ? 0.0 : async_velocity_command_.load()};
+          feedback_ = actuator_interface_->sendVelocitySetpoint(radToDeg(direction_sign_ * cmd));
         } else if (effort_interface_running_) {
-          feedback_ = actuator_interface_->sendTorqueSetpoint(direction_sign_ * async_effort_command_.load(), torque_constant_);
+          double const cmd {hold_until_fresh ? 0.0 : async_effort_command_.load()};
+          feedback_ = actuator_interface_->sendTorqueSetpoint(direction_sign_ * cmd, torque_constant_);
         } else if (motion_interface_running_) {
           // Clamp kp/kd to [0, 4095] and cast to uint16_t
           auto clamp12 = [](double x) -> std::uint16_t {
@@ -651,11 +758,11 @@ namespace myactuator_rmd_hardware {
             if (x > 4095.0) return static_cast<std::uint16_t>(4095);
             return static_cast<std::uint16_t>(x);
           };
-          auto const p = async_motion_p_command_.load();
-          auto const v = async_motion_v_command_.load();
-          auto const kp = clamp12(async_motion_kp_command_.load());
-          auto const kd = clamp12(async_motion_kd_command_.load());
-          auto const tff = async_motion_tff_command_.load();
+          auto const p = hold_until_fresh ? held_position : async_motion_p_command_.load();
+          auto const v = hold_until_fresh ? 0.0 : async_motion_v_command_.load();
+          auto const kp = hold_until_fresh ? std::uint16_t{0} : clamp12(async_motion_kp_command_.load());
+          auto const kd = hold_until_fresh ? std::uint16_t{0} : clamp12(async_motion_kd_command_.load());
+          auto const tff = hold_until_fresh ? 0.0 : async_motion_tff_command_.load();
           // Interleaved send/recv: send both commands first, then receive both
           // responses. This overlaps the motor processing time for the angle
           // request with the wait for the motion mode response, saving ~0.75ms
